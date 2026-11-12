@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { Session } from "@supabase/supabase-js";
-import { supabase } from "./supabase";
+import { LOCAL_USER_ID, deleteSession as removeSession, exportBackup, importBackup, loadData as loadSavedData, saveCheckIn, saveSession } from "./storage";
 import type { CheckIn, StudySession } from "./types";
 
 type ActiveTimer = {
@@ -31,20 +30,20 @@ const FIREWORKS = [
 const FIREWORK_ANGLES = Array.from({ length: 24 }, (_, index) => index * 15);
 const CELEBRATION_DURATION_MS = 30_000;
 
-const activeTimerKey = (userId: string) => `libris-active-timer:${userId}`;
-const readActiveTimer = (userId: string): ActiveTimer | null => {
+const ACTIVE_TIMER_KEY = "libris-active-timer:local";
+const readActiveTimer = (): ActiveTimer | null => {
   try {
-    const saved = window.localStorage.getItem(activeTimerKey(userId));
+    const saved = window.localStorage.getItem(ACTIVE_TIMER_KEY);
     if (!saved) return null;
     const timer = JSON.parse(saved) as Partial<ActiveTimer>;
     if (typeof timer.sessionId !== "string" || typeof timer.startedAt !== "number" || !Number.isFinite(timer.startedAt) || timer.startedAt <= 0 || timer.startedAt > Date.now()) return null;
     return {
       sessionId: timer.sessionId,
       startedAt: timer.startedAt,
-      accumulatedSeconds: typeof timer.accumulatedSeconds === "number" && timer.accumulatedSeconds >= 0 ? timer.accumulatedSeconds : 0,
-      segmentStartedAt: typeof timer.segmentStartedAt === "number" && timer.segmentStartedAt <= Date.now() ? timer.segmentStartedAt : null,
-      location: typeof timer.location === "string" ? timer.location : "",
-      subject: typeof timer.subject === "string" ? timer.subject : "",
+      accumulatedSeconds: Number.isSafeInteger(timer.accumulatedSeconds) && timer.accumulatedSeconds! >= 0 ? timer.accumulatedSeconds! : 0,
+      segmentStartedAt: typeof timer.segmentStartedAt === "number" && Number.isFinite(timer.segmentStartedAt) && timer.segmentStartedAt >= timer.startedAt && timer.segmentStartedAt <= Date.now() ? timer.segmentStartedAt : null,
+      location: typeof timer.location === "string" ? timer.location.slice(0, 100) : "",
+      subject: typeof timer.subject === "string" ? timer.subject.slice(0, 80) : "",
       celebratedIntervals: typeof timer.celebratedIntervals === "number" && timer.celebratedIntervals >= 0 ? Math.floor(timer.celebratedIntervals) : 0,
     };
   } catch {
@@ -52,15 +51,18 @@ const readActiveTimer = (userId: string): ActiveTimer | null => {
   }
 };
 
-const saveActiveTimer = (userId: string, timer: ActiveTimer) => {
-  try { window.localStorage.setItem(activeTimerKey(userId), JSON.stringify(timer)); } catch { /* Storage can be unavailable in private browsing. */ }
+const saveActiveTimer = (timer: ActiveTimer) => {
+  try { window.localStorage.setItem(ACTIVE_TIMER_KEY, JSON.stringify(timer)); }
+  catch { throw new Error("Your browser could not save the timer. Allow site storage, then try again."); }
 };
 
-const clearActiveTimer = (userId: string) => {
-  try { window.localStorage.removeItem(activeTimerKey(userId)); } catch { /* Storage can be unavailable in private browsing. */ }
+const clearActiveTimer = () => {
+  try { window.localStorage.removeItem(ACTIVE_TIMER_KEY); }
+  catch { throw new Error("Your session was saved, but the browser could not clear the timer. Allow site storage, then stop it again."); }
 };
 
 const elapsedSeconds = (timer: ActiveTimer) => timer.accumulatedSeconds + (timer.segmentStartedAt === null ? 0 : Math.max(0, Math.floor((Date.now() - timer.segmentStartedAt) / 1000)));
+const errorMessage = (issue: unknown) => issue instanceof Error ? issue.message : "Your browser could not save this change. Please try again.";
 
 const formatDuration = (seconds: number) => {
   const hours = Math.floor(seconds / 3600);
@@ -69,10 +71,9 @@ const formatDuration = (seconds: number) => {
   return minutes ? `${minutes}m` : `${seconds}s`;
 };
 
-export default function Dashboard({ session }: { session: Session }) {
-  const user = session.user;
-  const displayName = String(user.user_metadata?.display_name || "Student");
-  const [initialTimer] = useState(() => readActiveTimer(user.id));
+export default function Dashboard() {
+  const displayName = "Student";
+  const [initialTimer] = useState(readActiveTimer);
   const [sessions, setSessions] = useState<StudySession[]>([]);
   const [checkIns, setCheckIns] = useState<CheckIn[]>([]);
   const [location, setLocation] = useState(initialTimer?.location || "");
@@ -80,24 +81,44 @@ export default function Dashboard({ session }: { session: Session }) {
   const [activeTimer, setActiveTimer] = useState<ActiveTimer | null>(initialTimer);
   const [seconds, setSeconds] = useState(() => initialTimer ? elapsedSeconds(initialTimer) : 0);
   const [busy, setBusy] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [ownsTab, setOwnsTab] = useState(false);
+  const [anotherTabOpen, setAnotherTabOpen] = useState(false);
   const [error, setError] = useState("");
+  const [backupMessage, setBackupMessage] = useState("");
+  const importInput = useRef<HTMLInputElement>(null);
   const [celebrationMinutes, setCelebrationMinutes] = useState<number | null>(null);
+  const canEdit = ready && ownsTab;
   const running = activeTimer?.segmentStartedAt != null;
   const paused = Boolean(activeTimer && !running);
 
   async function loadData() {
-    if (!supabase) return;
-    const [sessionResult, checkInResult] = await Promise.all([
-      supabase.from("study_sessions").select("*").order("started_at", { ascending: false }).limit(50),
-      supabase.from("library_check_ins").select("*").order("checked_in_at", { ascending: false }).limit(30),
-    ]);
-    const issue = sessionResult.error || checkInResult.error;
-    if (issue) setError(issue.message);
-    setSessions((sessionResult.data || []) as StudySession[]);
-    setCheckIns((checkInResult.data || []) as CheckIn[]);
+    try {
+      const saved = await loadSavedData();
+      setSessions(saved.sessions);
+      setCheckIns(saved.checkIns);
+      setReady(true);
+      return true;
+    } catch (issue) {
+      setError(errorMessage(issue));
+      return false;
+    }
   }
 
-  useEffect(() => { void loadData(); }, []);
+  // Hold one writer for this browser so an older tab cannot revive a stopped timer.
+  useEffect(() => {
+    if (!navigator.locks) { setOwnsTab(true); return; }
+    let disposed = false;
+    let release = () => {};
+    void navigator.locks.request("libris-focus-local-writer", { ifAvailable: true }, async (lock) => {
+      if (disposed) return;
+      if (!lock) { setAnotherTabOpen(true); return; }
+      setOwnsTab(true);
+      await new Promise<void>((resolve) => { release = resolve; });
+    }).catch(() => { if (!disposed) setError("Your browser could not open local saves. Reload Libris and try again."); });
+    return () => { disposed = true; release(); };
+  }, []);
+  useEffect(() => { if (ownsTab) void loadData(); }, [ownsTab]);
   useEffect(() => {
     if (!activeTimer) return;
     const updateElapsedTime = () => setSeconds(elapsedSeconds(activeTimer));
@@ -106,13 +127,13 @@ export default function Dashboard({ session }: { session: Session }) {
     return () => window.clearInterval(timer);
   }, [activeTimer]);
   useEffect(() => {
-    if (!activeTimer) return;
+    if (!activeTimer || !ownsTab) return;
     const updatedTimer = { ...activeTimer, location, subject };
-    saveActiveTimer(user.id, updatedTimer);
-  }, [activeTimer, location, subject, user.id]);
+    try { saveActiveTimer(updatedTimer); } catch (issue) { setError(errorMessage(issue)); }
+  }, [activeTimer, location, subject, ownsTab]);
   useEffect(() => {
-    if (!activeTimer || !running) return;
-    const sync = () => { void syncSession(activeTimer, elapsedSeconds(activeTimer)); };
+    if (!activeTimer || !running || !ready || !ownsTab) return;
+    const sync = () => { void syncSession({ ...activeTimer, location, subject }, elapsedSeconds(activeTimer)); };
     const syncTimer = window.setInterval(sync, 5000);
     const saveWhenHidden = () => { if (document.visibilityState === "hidden") sync(); };
     document.addEventListener("visibilitychange", saveWhenHidden);
@@ -120,32 +141,32 @@ export default function Dashboard({ session }: { session: Session }) {
       window.clearInterval(syncTimer);
       document.removeEventListener("visibilitychange", saveWhenHidden);
     };
-  }, [activeTimer, running, location, subject]);
+  }, [activeTimer, running, location, subject, ready, ownsTab]);
   useEffect(() => {
-    if (!activeTimer || !running) return;
+    if (!activeTimer || !running || !ownsTab) return;
     const pauseWhenLeaving = () => {
       const duration = elapsedSeconds(activeTimer);
       const pausedTimer = { ...activeTimer, accumulatedSeconds: duration, segmentStartedAt: null, location, subject };
-      saveActiveTimer(user.id, pausedTimer);
+      try { saveActiveTimer(pausedTimer); } catch (issue) { setError(errorMessage(issue)); }
       setActiveTimer(pausedTimer);
       setSeconds(duration);
       void syncSession(pausedTimer, duration);
     };
     window.addEventListener("pagehide", pauseWhenLeaving);
     return () => window.removeEventListener("pagehide", pauseWhenLeaving);
-  }, [activeTimer, running, location, subject, user.id]);
+  }, [activeTimer, running, location, subject, ownsTab]);
   useEffect(() => {
-    if (initialTimer?.segmentStartedAt === null) void syncSession(initialTimer, initialTimer.accumulatedSeconds);
-  }, []);
+    if (ready && ownsTab && initialTimer) void syncSession(initialTimer, elapsedSeconds(initialTimer));
+  }, [ready, ownsTab]);
   useEffect(() => {
-    if (!activeTimer) return;
+    if (!activeTimer || !ownsTab) return;
     const completedIntervals = Math.floor(seconds / 1800);
     if (completedIntervals < 1 || completedIntervals <= activeTimer.celebratedIntervals) return;
     const celebratedTimer = { ...activeTimer, celebratedIntervals: completedIntervals };
     setActiveTimer(celebratedTimer);
-    saveActiveTimer(user.id, celebratedTimer);
+    try { saveActiveTimer(celebratedTimer); } catch (issue) { setError(errorMessage(issue)); }
     setCelebrationMinutes(completedIntervals * 30);
-  }, [activeTimer, seconds, user.id]);
+  }, [activeTimer, seconds, ownsTab]);
   useEffect(() => {
     if (celebrationMinutes === null) return;
     const hideCelebration = window.setTimeout(() => setCelebrationMinutes(null), CELEBRATION_DURATION_MS);
@@ -160,58 +181,47 @@ export default function Dashboard({ session }: { session: Session }) {
   const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(location)}`;
 
   async function checkIn() {
-    if (!supabase || !location.trim()) return;
+    if (!canEdit || !location.trim()) return;
     setBusy(true); setError("");
-    const { error: issue } = await supabase.from("library_check_ins").insert({ user_id: user.id, location: location.trim() });
-    if (issue) setError(issue.message); else await loadData();
-    setBusy(false);
+    try {
+      const record: CheckIn = { id: crypto.randomUUID(), user_id: LOCAL_USER_ID, location: location.trim(), checked_in_at: new Date().toISOString() };
+      await saveCheckIn(record);
+      setCheckIns((items) => [record, ...items]);
+    } catch (issue) { setError(errorMessage(issue)); }
+    finally { setBusy(false); }
   }
 
   async function syncSession(timer: ActiveTimer, duration: number) {
-    if (!supabase) return false;
-    const endedAt = new Date();
-    const savedLocation = location.trim() || "Independent study";
-    const savedSubject = subject.trim() || "General study";
-    const { error: issue } = await supabase.from("study_sessions").update({
-      location: savedLocation,
-      subject: savedSubject,
-      ended_at: endedAt.toISOString(),
-      duration_seconds: Math.max(1, duration),
-    }).eq("id", timer.sessionId);
-    if (issue) { setError(issue.message); return false; }
-    setSessions((items) => items.map((item) => item.id === timer.sessionId ? { ...item, location: savedLocation, subject: savedSubject, ended_at: endedAt.toISOString(), duration_seconds: Math.max(1, duration) } : item));
-    return true;
+    const record: StudySession = {
+      id: timer.sessionId,
+      user_id: LOCAL_USER_ID,
+      location: timer.location.trim() || "Independent study",
+      subject: timer.subject.trim() || "General study",
+      started_at: new Date(timer.startedAt).toISOString(),
+      ended_at: new Date().toISOString(),
+      duration_seconds: Math.max(0, Math.floor(duration)),
+    };
+    try {
+      await saveSession(record);
+      setSessions((items) => [record, ...items.filter((item) => item.id !== record.id)].sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at)));
+      return true;
+    } catch (issue) { setError(errorMessage(issue)); return false; }
   }
 
   async function startTimer() {
-    if (running || !supabase) return;
-    if (activeTimer) {
-      const resumedTimer = { ...activeTimer, segmentStartedAt: Date.now(), location, subject };
-      setActiveTimer(resumedTimer);
-      saveActiveTimer(user.id, resumedTimer);
-      return;
-    }
+    if (running || !canEdit) return;
     setBusy(true); setError("");
-    const startedAt = Date.now();
-    const savedLocation = location.trim() || "Independent study";
-    const savedSubject = subject.trim() || "General study";
-    const { data, error: issue } = await supabase.from("study_sessions").insert({
-      user_id: user.id,
-      location: savedLocation,
-      subject: savedSubject,
-      started_at: new Date(startedAt).toISOString(),
-      ended_at: new Date(startedAt).toISOString(),
-      duration_seconds: 1,
-    }).select().single();
-    if (issue) setError(issue.message);
-    else if (data) {
-      const timer: ActiveTimer = { sessionId: data.id, startedAt, accumulatedSeconds: 0, segmentStartedAt: startedAt, location, subject, celebratedIntervals: 0 };
+    try {
+      const startedAt = Date.now();
+      const timer: ActiveTimer = activeTimer
+        ? { ...activeTimer, segmentStartedAt: startedAt, location, subject }
+        : { sessionId: crypto.randomUUID(), startedAt, accumulatedSeconds: 0, segmentStartedAt: startedAt, location, subject, celebratedIntervals: 0 };
+      if (!await syncSession(timer, elapsedSeconds(timer))) return;
+      saveActiveTimer(timer);
       setActiveTimer(timer);
-      setSeconds(0);
-      saveActiveTimer(user.id, timer);
-      setSessions((items) => [data as StudySession, ...items.filter((item) => item.id !== data.id)]);
-    }
-    setBusy(false);
+      setSeconds(elapsedSeconds(timer));
+    } catch (issue) { setError(errorMessage(issue)); }
+    finally { setBusy(false); }
   }
 
   async function pauseTimer() {
@@ -220,35 +230,84 @@ export default function Dashboard({ session }: { session: Session }) {
     const pausedTimer = { ...activeTimer, accumulatedSeconds: duration, segmentStartedAt: null, location, subject };
     setActiveTimer(pausedTimer);
     setSeconds(duration);
-    saveActiveTimer(user.id, pausedTimer);
     setBusy(true); setError("");
-    await syncSession(pausedTimer, duration);
-    setBusy(false);
+    try {
+      saveActiveTimer(pausedTimer);
+      await syncSession(pausedTimer, duration);
+    } catch (issue) { setError(errorMessage(issue)); }
+    finally { setBusy(false); }
   }
 
   async function stopTimer() {
     if (!activeTimer) return;
     const duration = elapsedSeconds(activeTimer);
     setBusy(true); setError("");
-    const saved = await syncSession(activeTimer, duration);
-    if (saved) {
-      setActiveTimer(null);
-      setSeconds(0);
-      setLocation("");
-      setSubject("");
-      clearActiveTimer(user.id);
-    }
-    setBusy(false);
+    const pausedTimer = { ...activeTimer, accumulatedSeconds: duration, segmentStartedAt: null, location, subject };
+    setActiveTimer(pausedTimer);
+    setSeconds(duration);
+    try {
+      saveActiveTimer(pausedTimer);
+      if (await syncSession(pausedTimer, duration)) {
+        clearActiveTimer();
+        setActiveTimer(null);
+        setSeconds(0);
+        setLocation("");
+        setSubject("");
+      }
+    } catch (issue) { setError(errorMessage(issue)); }
+    finally { setBusy(false); }
   }
 
   async function deleteSession(sessionId: string) {
-    if (!supabase || sessionId === activeTimer?.sessionId) return;
+    if (!canEdit || sessionId === activeTimer?.sessionId) return;
     if (!window.confirm("Delete this study session? This cannot be undone.")) return;
     setBusy(true); setError("");
-    const { error: issue } = await supabase.from("study_sessions").delete().eq("id", sessionId);
-    if (issue) setError(issue.message);
-    else setSessions((items) => items.filter((item) => item.id !== sessionId));
-    setBusy(false);
+    try {
+      await removeSession(sessionId);
+      setSessions((items) => items.filter((item) => item.id !== sessionId));
+    } catch (issue) { setError(errorMessage(issue)); }
+    finally { setBusy(false); }
+  }
+
+  async function downloadBackup() {
+    setBusy(true); setError(""); setBackupMessage("");
+    try {
+      if (activeTimer && !await syncSession({ ...activeTimer, location, subject }, elapsedSeconds(activeTimer))) return;
+      const contents = await exportBackup();
+      const url = URL.createObjectURL(new Blob([contents], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `libris-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setBackupMessage("Backup ready. Keep the downloaded file somewhere safe.");
+    } catch (issue) { setError(errorMessage(issue)); }
+    finally { setBusy(false); }
+  }
+
+  async function restoreBackup(file: File) {
+    if (activeTimer) { setError("Stop your timer before importing a backup."); return; }
+    setBusy(true); setError(""); setBackupMessage("");
+    try {
+      if (file.size > 25 * 1024 * 1024) throw new Error("Choose a backup smaller than 25 MB.");
+      const result = await importBackup(await file.text());
+      if (await loadData()) setBackupMessage(`Imported ${result.sessions} sessions and ${result.checkIns} check-ins. Your existing history is kept; matching records are updated.`);
+    } catch (issue) { setError(errorMessage(issue)); }
+    finally { setBusy(false); if (importInput.current) importInput.current.value = ""; }
+  }
+
+  async function protectLocalSaves() {
+    setBusy(true); setBackupMessage("");
+    try {
+      const protectedStorage = navigator.storage?.persist && await navigator.storage.persist();
+      setBackupMessage(protectedStorage
+        ? "This browser granted protection against automatic storage cleanup. Keep a backup too."
+        : "This browser hasn't granted storage protection. Install Libris on your home screen and keep regular backups.");
+    } catch {
+      setBackupMessage("Storage protection isn't available here. Install Libris on your home screen and keep regular backups.");
+    } finally { setBusy(false); }
   }
 
   const timerText = [Math.floor(seconds / 3600), Math.floor((seconds % 3600) / 60), seconds % 60].map((value) => String(value).padStart(2, "0")).join(":");
@@ -259,8 +318,8 @@ export default function Dashboard({ session }: { session: Session }) {
     <main className="dashboard-shell">
       <aside className="sidebar">
         <a className="brand" href="#overview"><span className="brand-mark">L</span><span>Libris</span></a>
-        <nav className="side-nav"><a className="active" href="#overview">⌂ Overview</a><a href="#timer">◷ Study timer</a><a href="#history">▤ History</a></nav>
-        <div className="profile-card"><span className="avatar">{displayName.slice(0, 1).toUpperCase()}</span><div><b>{displayName}</b><small>{user.email}</small></div><button onClick={() => supabase?.auth.signOut()} aria-label="Log out">↗</button></div>
+        <nav className="side-nav"><a className="active" href="#overview">⌂ Overview</a><a href="#timer">◷ Study timer</a><a href="#history">▤ History</a><a href="#backups">↓ Backups</a></nav>
+        <div className="profile-card"><span className="avatar">{displayName.slice(0, 1).toUpperCase()}</span><div><b>Your study space</b><small>Saved on this device</small></div></div>
       </aside>
 
       <div className="dashboard-main">
@@ -269,7 +328,8 @@ export default function Dashboard({ session }: { session: Session }) {
           <div className="date-chip">◌ {new Intl.DateTimeFormat("en", { weekday: "long", month: "long", day: "numeric" }).format(new Date())}</div>
         </header>
 
-        {error && <div className="error-banner" role="alert">{error}</div>}
+        {error && <div className="error-banner" role="alert">{error}{!ready && <button className="button light" onClick={() => { setError(""); void loadData(); }}>Try again</button>}</div>}
+        {anotherTabOpen && <div className="error-banner" role="status">Libris is already open in another tab. Close that tab, then reload this one to continue.<button className="button light" onClick={() => window.location.reload()}>Reload Libris</button></div>}
 
         <section className="dashboard-grid">
           <article className="timer-card" id="timer">
@@ -281,9 +341,9 @@ export default function Dashboard({ session }: { session: Session }) {
             </div>
             <a className="maps-link" href={mapsUrl} target="_blank" rel="noreferrer">⌖ View this place in Google Maps ↗</a>
             <div className="timer-actions">
-              <button className="button timer-button start" onClick={startTimer} disabled={busy || running}>{paused ? "Resume" : "Start"}</button>
-              <button className="button timer-button pause" onClick={pauseTimer} disabled={busy || !running}>Pause</button>
-              <button className="button timer-button stop" onClick={stopTimer} disabled={busy || !activeTimer}>{busy ? "Saving…" : "Stop"}</button>
+              <button className="button timer-button start" onClick={startTimer} disabled={!canEdit || busy || running}>{paused ? "Resume" : "Start"}</button>
+              <button className="button timer-button pause" onClick={pauseTimer} disabled={!canEdit || busy || !running}>Pause</button>
+              <button className="button timer-button stop" onClick={stopTimer} disabled={!canEdit || busy || !activeTimer}>{busy ? "Saving…" : "Stop"}</button>
             </div>
           </article>
 
@@ -293,7 +353,7 @@ export default function Dashboard({ session }: { session: Session }) {
             <p>{checkedInToday ? `Checked in at ${new Date(latestCheckIn.checked_in_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "Type a place and mark today's visit."}</p>
             <input value={location} onChange={(e) => setLocation(e.target.value)} maxLength={100} placeholder="Type a place or address" autoComplete="off" />
             <a className="maps-link light" href={mapsUrl} target="_blank" rel="noreferrer">Open in Google Maps ↗</a>
-            <button className="button light wide" onClick={checkIn} disabled={busy}>Check in here</button>
+            <button className="button light wide" onClick={checkIn} disabled={!canEdit || busy || !location.trim()}>Check in here</button>
           </article>
 
           <article className="stat-card"><div><p className="eyebrow">TODAY</p><strong>{formatDuration(todaySeconds)}</strong><span>focused time</span></div><div className="mini-ring" style={{ "--progress": `${Math.min(100, todaySeconds / 108)}%` } as React.CSSProperties}><span>{Math.min(100, Math.round(todaySeconds / 108))}%</span></div></article>
@@ -307,6 +367,19 @@ export default function Dashboard({ session }: { session: Session }) {
               <article key={item.id}><span className="history-icon">◷</span><div className="history-main"><b>{item.subject}</b><a href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(item.location)}`} target="_blank" rel="noreferrer">⌖ {item.location} ↗</a></div><div className="history-date">{new Date(item.started_at).toLocaleDateString([], { month: "short", day: "numeric" })}<small>{new Date(item.started_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small></div><strong>{formatDuration(item.duration_seconds)}</strong><button className="delete-session" onClick={() => void deleteSession(item.id)} disabled={busy || item.id === activeTimer?.sessionId} title={item.id === activeTimer?.sessionId ? "Stop this session before deleting it" : "Delete this session"} aria-label={`Delete ${item.subject} session`}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" /></svg></button></article>
             ))}
           </div>
+        </section>
+
+        <section className="backup-section" id="backups" aria-labelledby="backup-title">
+          <div><p className="eyebrow">SAVED ON THIS DEVICE</p><h2 id="backup-title">Keep your progress safe</h2><p>Your history stays in this browser. Export a backup before clearing browser data, or import one to move to another device.</p></div>
+          <div className="backup-actions">
+            <button className="button primary" onClick={downloadBackup} disabled={!canEdit || busy}>Export backup</button>
+            <button className="button light" onClick={() => importInput.current?.click()} disabled={!canEdit || busy || Boolean(activeTimer)}>Import backup</button>
+            <button className="button light" onClick={protectLocalSaves} disabled={!canEdit || busy}>Protect local saves</button>
+            <input ref={importInput} type="file" accept="application/json,.json" aria-label="Import backup file" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void restoreBackup(file); }} />
+          </div>
+          <p className="backup-hint">On iPhone or iPad, add Libris to your Home Screen and open it there to protect against Safari's inactivity cleanup.</p>
+          {activeTimer && <p className="backup-hint">Stop your timer before importing a backup.</p>}
+          {backupMessage && <p className="backup-status" role="status">{backupMessage}</p>}
         </section>
       </div>
       {celebrationMinutes !== null && createPortal(
