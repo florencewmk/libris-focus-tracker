@@ -84,7 +84,7 @@ input:focus { border-color: var(--terracotta); box-shadow: 0 0 0 3px rgb(201 107
 .status-dot.live { background: #f29b74; box-shadow: 0 0 0 5px rgb(242 155 116 / 15%); }
 .status-dot.paused { background: #f4d39b; box-shadow: 0 0 0 5px rgb(244 211 155 / 15%); }
 .timer-display { margin: 35px 0; font-size: clamp(52px, 7vw, 90px); font-weight: 500; letter-spacing: -5px; text-align: center; font-variant-numeric: tabular-nums; }
-.timer-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.timer-fields { display: grid; grid-template-columns: 1fr; gap: 12px; margin-bottom: 20px; }
 .timer-fields label { color: #aebfba; font-size: 11px; font-weight: 900; letter-spacing: 1.3px; }
 .timer-fields input { margin-top: 7px; border-color: white; color: #111; background: white; font-size: 11px; }
 .timer-fields input::placeholder { color: #747b78; opacity: 1; }
@@ -178,7 +178,6 @@ input:focus { border-color: var(--terracotta); box-shadow: 0 0 0 3px rgb(201 107
   .date-chip { display: inline-block; margin-top: 18px; }
   .dashboard-grid { grid-template-columns: 1fr; }
   .timer-card { grid-row: auto; }
-  .timer-fields { grid-template-columns: 1fr; }
   .timer-display { font-size: 58px; letter-spacing: -3px; }
   .history-list article { grid-template-columns: 38px minmax(0, 1fr) auto auto; }
   .history-date { display: none; }
