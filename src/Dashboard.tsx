@@ -336,10 +336,8 @@ export default function Dashboard() {
             <div className="card-heading"><span><i className={`status-dot ${running ? "live" : paused ? "paused" : ""}`} />{running ? "SESSION IN PROGRESS" : paused ? "SESSION PAUSED" : "READY TO FOCUS"}</span><b>◷</b></div>
             <div className="timer-display">{timerText}</div>
             <div className="timer-fields">
-              <label>LOCKING IN AT<input value={location} onChange={(e) => setLocation(e.target.value)} maxLength={100} placeholder="Library, café, campus, or address" autoComplete="off" /></label>
               <label>FOCUS<input value={subject} onChange={(e) => setSubject(e.target.value)} maxLength={80} placeholder="Subjects, books, etc." autoComplete="off" /></label>
             </div>
-            <a className="maps-link" href={mapsUrl} target="_blank" rel="noreferrer">⌖ View this place in Google Maps ↗</a>
             <div className="timer-actions">
               <button className="button timer-button start" onClick={startTimer} disabled={!canEdit || busy || running}>{paused ? "Resume" : "Start"}</button>
               <button className="button timer-button pause" onClick={pauseTimer} disabled={!canEdit || busy || !running}>Pause</button>
